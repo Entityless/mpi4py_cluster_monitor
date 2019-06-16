@@ -16,12 +16,8 @@ comm_sz = comm.Get_size()
 
 parser = argparse.ArgumentParser()
 
-tag_start_txt = '19260817_start'
-tag_end_txt = 'that elder changed the China'
-
-#recognized by pssh
-#should be positive integer
-parser.add_argument('-i', '-interval', '--interval', help='Hostfile', default='5')
+parser.add_argument('-i', '-interval', '--interval', default='5')
+parser.add_argument('-s', '-stop_signal_file_prefix', '--stop_signal_file_prefix', default='/tmp/stop-mpi4py-cluster-monitor.sgf')
 
 args = vars(parser.parse_args())
 
@@ -34,13 +30,12 @@ for i in range(1000):
 def run_bg_cmd(command):
 
     proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
-    proc.wait() #this works
+    proc.wait()
 
     lns_content = []
 
     for line in io.TextIOWrapper(proc.stdout, encoding="utf-8"):
         lns_content.append(line[:-1])
-    #     print(line[:-1])
 
     return lns_content
 
@@ -49,7 +44,6 @@ def get_logicical_core_cnt():
     return int(ccnt_str)
 
 def get_hostname():
-    # return run_bg_cmd("echo $HOSTNAME")[0] #不可行，因为mpi会继承环境变量
     return run_bg_cmd('hostname')[0]
 
 def get_mem_swap_sz():
@@ -92,9 +86,6 @@ def get_cur_used_mem():
 
 def get_cpu_usage_list():
     ret_lns = run_bg_cmd('mpstat -P ALL 1 1')
-
-    #check which column %idle is in, and where the 'average' is start
-
     av_ln_idx = -1
     av_hit = False
 
@@ -127,7 +118,6 @@ if __name__ == "__main__":
     sleep_interval = int(args['interval'])
     if(sleep_interval <= 0):
         sleep_interval = 5
-    #事实上，因为CPU的采样时间需要1秒，所以周期回避sleep_interval多一秒
 
     #get sys config
     ccnt = get_logicical_core_cnt()
@@ -136,9 +126,6 @@ if __name__ == "__main__":
 
     if(my_rank == 0):
         logf_name = 'mpi4py_cluster_monitor.log'
-        # logf = open(logf_name, 'a')
-        # logf.write(to_print)
-        # logf.close()
         print('The sleep interval: ', sleep_interval)
         sys.stdout.flush()
 
@@ -155,12 +142,18 @@ if __name__ == "__main__":
         for d in host_info:
             print(d)
 
-        #host_info is a list of info dic
+    launch_time = time.time()
+    launch_time_ts = int(launch_time * 1000)
+    loop_cnt = 0
+    penalty_time = 0.0
 
+    stop_hint_filename = '{}.{}.hint'.format(args['stop_signal_file_prefix'], launch_time_ts)
+    stop_signal_filename = '{}.{}.stop'.format(args['stop_signal_file_prefix'], launch_time_ts)
+
+    os.system('touch {}'.format(stop_hint_filename))
 
     while True:
-
-        #run the command
+        loop_cnt += 1
         used_mem = get_cur_used_mem()
         free_mem = mem - used_mem
 
@@ -172,8 +165,6 @@ if __name__ == "__main__":
             while(not (len(tmpstr) == 3)):
                 tmpstr = " " + tmpstr
             usage_txt = usage_txt + " " + tmpstr
-
-        #获得了这些数据之后，需要处理成字符串
 
         my_info_dic = {}
         my_info_dic['hn'] = hostname
@@ -202,5 +193,28 @@ if __name__ == "__main__":
             logf.close()
 
         comm.Barrier()
-        # break
-        time.sleep(sleep_interval)
+
+        to_stop = 0
+        if (os.path.isfile(stop_signal_filename)):
+            to_stop = 1
+        to_stop = comm.allreduce(to_stop, op=MPI.MAX)
+        if (to_stop == 1):
+            break
+
+        next_wake_time = launch_time + penalty_time + loop_cnt * sleep_interval
+        time_after_barrier = time.time()
+        time_to_sleep = next_wake_time - time_after_barrier
+
+        local_time_penalty = 0.0
+
+        if (time_to_sleep < 0):
+            # make time_to_sleep = 0
+            local_time_penalty += 0.0 - time_to_sleep
+
+        local_time_penalty = comm.allreduce(local_time_penalty, op=MPI.MAX)
+        penalty_time += local_time_penalty
+
+        next_wake_time = launch_time + penalty_time + loop_cnt * sleep_interval
+        time_to_sleep = next_wake_time - time_after_barrier
+
+        time.sleep(time_to_sleep)
